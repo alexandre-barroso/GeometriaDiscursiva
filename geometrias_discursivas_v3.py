@@ -1,12 +1,7 @@
 import os
 import sys
 
-# -----------------------------------------------------------------------------
-# Deterministic execution guard
-# -----------------------------------------------------------------------------
-# Gensim's Word2Vec can vary across runs unless Python hashing, worker count, and
-# numeric thread scheduling are controlled. These variables must be set before
-# importing numpy/gensim, so the script re-executes itself once when needed.
+
 DETERMINISTIC_SEED = 42
 _REQUIRED_ENV = {
     'PYTHONHASHSEED': str(DETERMINISTIC_SEED),
@@ -37,6 +32,8 @@ import shutil
 import urllib.request
 
 import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
+from matplotlib.ticker import FuncFormatter, MaxNLocator
 import nltk
 import numpy as np
 from gensim.models import KeyedVectors, Word2Vec
@@ -52,18 +49,7 @@ nltk.download('stopwords', quiet=True)
 
 FASTTEXT_URL = 'https://dl.fbaipublicfiles.com/fasttext/vectors-crawl/cc.pt.300.vec.gz'
 
-# Resolve paths from the directory where this script lives, not from whatever
-# directory the shell happens to use as the current working directory.
-# Expected repository layout:
-#   repo/
-#     geometrias_discursivas_v3.py
-#     corpora/
-#       corpus_debates.txt
-#       corpus_comentarios.txt
-#     img/
-#     models/
-#     pretrained_models/
-#     legacy/
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CORPORA_DIR = os.path.join(BASE_DIR, 'corpora')
 IMG_DIR = os.path.join(BASE_DIR, 'img')
@@ -73,23 +59,24 @@ PRE_TRAINED_MODELS = os.path.join(BASE_DIR, 'pretrained_models')
 FASTTEXT_GZ = os.path.join(PRE_TRAINED_MODELS, 'cc.pt.300.vec.gz')
 FASTTEXT_VEC = os.path.join(PRE_TRAINED_MODELS, 'cc.pt.300.vec')
 
-# Output is now vector PDF, not PNG. The filename stem is unchanged.
+
 OUTPUT_FORMAT = 'pdf'
 DELETE_STALE_PNG_FILES = True
 
-# Reproducibility / paper-lock options. Defaults are conservative: do not
-# overwrite existing models, and reuse the saved path manifest once it exists.
+
 FORCE_RETRAIN_MODELS = os.environ.get('GEOMETRIAS_FORCE_RETRAIN', '0') == '1'
 REBUILD_PATH_MANIFEST = os.environ.get('GEOMETRIAS_REBUILD_PATHS', '0') == '1'
 PATH_MANIFEST = os.path.join(MODELS_DIR, 'discursive_paths_manifest.json')
 
-# Larger picture-in-picture panel + tighter crop around the dense core.
+
 ZOOM_CORE_FRACTION = 0.58
 ZOOM_MIN_CORE_POINTS = 8
 ZOOM_MAX_FRACTION_OF_FULL_WIDTH = 0.46
 ZOOM_MAX_FRACTION_OF_FULL_HEIGHT = 0.46
-INSET_WIDTH = 0.60
-INSET_HEIGHT = 0.58
+FIGURE_SIZE = (8.0, 8.0)
+LABEL_FONT_SIZE = 11.5
+LABEL_PADDING_PT = 2.5
+LABEL_GAP_PT = 3.0
 
 WORD_PAIRS = [
     ('democracia', 'ditadura'),
@@ -123,17 +110,16 @@ def ensure_fasttext():
     print('Modelo pronto.')
 
 
-try:
-    plt.style.use(['science', 'ieee'])
-except OSError:
-    plt.rcParams.update({
-        'font.family': 'serif',
-        'axes.grid': True,
-        'grid.alpha': 0.3,
-        'figure.dpi': 150,
-    })
-
 plt.rcParams.update({
+    'font.family': 'serif',
+    'font.serif': ['DejaVu Serif'],
+    'font.size': 11,
+    'figure.dpi': 144,
+    'axes.linewidth': 0.65,
+    'axes.edgecolor': '0.45',
+    'axes.grid': True,
+    'grid.color': '0.90',
+    'grid.linewidth': 0.45,
     'text.usetex': False,
     'pdf.fonttype': 42,
     'ps.fonttype': 42,
@@ -142,7 +128,7 @@ plt.rcParams.update({
 
 
 def stable_hash(text):
-    """Deterministic 32-bit hash for gensim initial-vector seeding."""
+
     if isinstance(text, bytes):
         data = text
     else:
@@ -350,392 +336,377 @@ def compute_or_load_paths(model_pop, model_inst, word1, word2):
     return path_pop, path_inst
 
 
-def plot_comparison(model_pop, model_inst, path_pop, path_inst, word1, word2):
-    """Plot full discursive paths plus a large picture-in-picture zoom.
+def _finite_range(values):
+    low, high = float(np.min(values)), float(np.max(values))
+    if not np.isfinite([low, high]).all():
+        raise ValueError('A projeção contém coordenadas não finitas.')
+    if high - low < 1e-9:
+        low, high = low - 0.5, high + 0.5
+    return low, high
 
-    The geometry is not recomputed inside the inset. The inset is a crop of the
-    same PCA coordinate system shown on the macro plot.
-    """
-    from matplotlib.patches import Rectangle
+
+def _limits(points, pad_fraction=0.14):
+    xmin, xmax = _finite_range(points[:, 0])
+    ymin, ymax = _finite_range(points[:, 1])
+    xpad = max((xmax - xmin) * pad_fraction, 0.08)
+    ypad = max((ymax - ymin) * pad_fraction, 0.08)
+    return xmin - xpad, xmax + xpad, ymin - ypad, ymax + ypad
+
+
+def _automatic_zoom_box(points):
+
+    center = np.median(points, axis=0)
+    distances = np.linalg.norm(points - center, axis=1)
+    n_core = min(len(points), max(ZOOM_MIN_CORE_POINTS,
+                                 int(np.ceil(len(points) * ZOOM_CORE_FRACTION))))
+    core = points[np.argsort(distances, kind='mergesort')[:n_core]]
+    xmin, xmax = _finite_range(core[:, 0])
+    ymin, ymax = _finite_range(core[:, 1])
+    fx0, fx1, fy0, fy1 = _limits(points, pad_fraction=0.02)
+    fw, fh = fx1 - fx0, fy1 - fy0
+    width = min(xmax - xmin + 2 * max((xmax - xmin) * 0.20, fw * 0.02, 0.035),
+                fw * ZOOM_MAX_FRACTION_OF_FULL_WIDTH)
+    height = min(ymax - ymin + 2 * max((ymax - ymin) * 0.24, fh * 0.02, 0.035),
+                 fh * ZOOM_MAX_FRACTION_OF_FULL_HEIGHT)
+    cx, cy = (xmin + xmax) / 2, (ymin + ymax) / 2
+    return cx - width / 2, cx + width / 2, cy - height / 2, cy + height / 2
+
+
+def _equal_scale_limits(ax, limits):
+
+    xmin, xmax, ymin, ymax = limits
+    ratio = ax.get_window_extent().width / ax.get_window_extent().height
+    width, height = xmax - xmin, ymax - ymin
+    width, height = max(width, height * ratio), max(height, width / ratio)
+    cx, cy = (xmin + xmax) / 2, (ymin + ymax) / 2
+    ax.set_xlim(cx - width / 2, cx + width / 2)
+    ax.set_ylim(cy - height / 2, cy + height / 2)
+    ax.set_aspect('equal', adjustable='box')
+    return (*ax.get_xlim(), *ax.get_ylim())
+
+
+def _inside_box(points, box):
+    xmin, xmax, ymin, ymax = box
+    return ((points[:, 0] >= xmin) & (points[:, 0] <= xmax) &
+            (points[:, 1] >= ymin) & (points[:, 1] <= ymax))
+
+
+def _zoom_with_clear_markers(ax, points):
+
+    box = _equal_scale_limits(ax, _automatic_zoom_box(points))
+    for _ in range(len(points)):
+        xmin, xmax, ymin, ymax = box
+        dx, dy = (xmax - xmin) * 0.025, (ymax - ymin) * 0.04
+        nearby = points[_inside_box(points, (xmin - dx, xmax + dx, ymin - dy, ymax + dy))]
+        if not len(nearby):
+            break
+        expanded = (min(xmin, float(nearby[:, 0].min()) - dx),
+                    max(xmax, float(nearby[:, 0].max()) + dx),
+                    min(ymin, float(nearby[:, 1].min()) - dy),
+                    max(ymax, float(nearby[:, 1].max()) + dy))
+        if np.allclose(expanded, box, rtol=0, atol=1e-10):
+            break
+        box = _equal_scale_limits(ax, expanded)
+    return box
+
+
+def _segments_hit_boxes(starts, ends, boxes):
+
+    starts = np.asarray(starts).reshape(-1, 2)
+    ends = np.asarray(ends).reshape(-1, 2)
+    boxes = np.asarray(boxes).reshape(-1, 4)
+    origin, delta = starts[:, None, :], (ends - starts)[:, None, :]
+    with np.errstate(divide='ignore', invalid='ignore'):
+        t0 = (boxes[None, :, :2] - origin) / delta
+        t1 = (boxes[None, :, 2:] - origin) / delta
+    parallel = np.abs(delta) < 1e-10
+    outside = (origin < boxes[None, :, :2]) | (origin > boxes[None, :, 2:])
+    lower = np.where(parallel, -np.inf, np.minimum(t0, t1))
+    upper = np.where(parallel, np.inf, np.maximum(t0, t1))
+    return ((np.maximum(lower.max(axis=2), 0) <= np.minimum(upper.min(axis=2), 1)) &
+            ~np.any(parallel & outside, axis=2))
+
+
+def _segments_cross(a, b, c, d):
+    a, b = np.asarray(a)[:, None, :], np.asarray(b)[:, None, :]
+    c, d = np.asarray(c)[None, :, :], np.asarray(d)[None, :, :]
+    def cross(u, v):
+        return u[..., 0] * v[..., 1] - u[..., 1] * v[..., 0]
+    return ((cross(b - a, c - a) * cross(b - a, d - a) < -1e-6) &
+            (cross(d - c, a - c) * cross(d - c, b - c) < -1e-6))
+
+
+def _place_labels(ax, records, all_points, segments, reserved=()):
+
+
+    if not records:
+        return []
+    fig = ax.figure
+    renderer = fig.canvas.get_renderer()
+    unit = fig.dpi / 72
+    gap = LABEL_GAP_PT * unit
+    padding = LABEL_PADDING_PT * unit
+    bounds = ax.get_window_extent().padded(-4 * unit)
+    nodes = ax.transData.transform(all_points)
+    visible = _inside_box(all_points, (*ax.get_xlim(), *ax.get_ylim()))
+    nodes = nodes[visible]
+    node_boxes = np.column_stack((nodes - 3.2 * unit, nodes + 3.2 * unit))
+    starts = ax.transData.transform(segments[:, 0])
+    ends = ax.transData.transform(segments[:, 1])
+    obstacles = np.asarray(reserved).reshape(-1, 4)
+
+    artists, anchors, sizes = [], [], []
+    for record in records:
+        text = ax.text(*record['point'], record['word'], ha='center', va='center',
+                       fontsize=LABEL_FONT_SIZE,
+                       fontweight='bold' if record['endpoint'] else 'normal',
+                       color='0.08', zorder=6,
+                       bbox=dict(boxstyle='square,pad=0.12', fc='white', ec='none'))
+        extent = text.get_window_extent(renderer)
+        artists.append(text)
+        anchors.append(ax.transData.transform(record['point']))
+        sizes.append([extent.width + 2 * padding, extent.height + 2 * padding])
+    anchors, sizes = np.array(anchors), np.array(sizes)
+
+    angles = np.arange(48) * (2 * np.pi / 48)
+    directions = np.column_stack((np.cos(angles), np.sin(angles)))
+    candidates = []
+    for anchor, size in zip(anchors, sizes):
+        offsets = np.concatenate([
+            directions * (size / 2 + (4 + radius) * unit)
+            for radius in (0, 4, 9, 16, 25, 37, 52, 72, 96, 125, 160)
+        ])
+        centers = anchor + offsets
+        boxes = np.column_stack((centers - size / 2, centers + size / 2))
+        valid = ((boxes[:, 0] >= bounds.x0) & (boxes[:, 1] >= bounds.y0) &
+                 (boxes[:, 2] <= bounds.x1) & (boxes[:, 3] <= bounds.y1))
+        for fixed in (node_boxes, obstacles):
+            overlaps = ((boxes[:, None, 0] < fixed[None, :, 2]) &
+                        (boxes[:, None, 2] > fixed[None, :, 0]) &
+                        (boxes[:, None, 1] < fixed[None, :, 3]) &
+                        (boxes[:, None, 3] > fixed[None, :, 1]))
+            valid &= ~overlaps.any(axis=1)
+        centers, boxes = centers[valid], boxes[valid]
+        delta = anchor - centers
+        edge_fraction = 1 / np.max(np.abs(delta) / (size / 2), axis=1)
+        leader_start = centers + delta * edge_fraction[:, None]
+        length = np.linalg.norm(anchor - leader_start, axis=1)
+        direction = (anchor - leader_start) / np.maximum(length[:, None], 1e-9)
+        leader_start += direction * np.minimum(length / 3, 1 * unit)[:, None]
+        leader_end = anchor - direction * np.minimum(length / 3, 3 * unit)[:, None]
+
+
+        other_nodes = node_boxes[np.linalg.norm(nodes - anchor, axis=1) > 6.4 * unit]
+        clear = ~_segments_hit_boxes(leader_start, leader_end, other_nodes).any(axis=1)
+        clear &= ~_segments_hit_boxes(leader_start, leader_end, obstacles).any(axis=1)
+        centers, boxes = centers[clear], boxes[clear]
+        leader_start, leader_end, length = leader_start[clear], leader_end[clear], length[clear]
+        path_hits = _segments_hit_boxes(starts, ends, boxes).sum(axis=0)
+        path_crossings = _segments_cross(leader_start, leader_end, starts, ends).sum(axis=1)
+
+        score = (path_hits * 4000 + path_crossings * 25 +
+                 length / unit + np.linalg.norm(centers - anchor, axis=1) / unit * 0.1)
+        candidates.append((centers, boxes, leader_start, leader_end, score))
+
+    def choose(i, placed):
+        centers, boxes, la, lb, scores = candidates[i]
+        valid = np.ones(len(boxes), dtype=bool)
+        cost = scores.copy()
+        if placed:
+            prev_boxes = np.array([item[1] for item in placed.values()])
+            pa = np.array([item[2] for item in placed.values()])
+            pb = np.array([item[3] for item in placed.values()])
+            overlaps = ((boxes[:, None, 0] < prev_boxes[None, :, 2] + gap) &
+                        (boxes[:, None, 2] > prev_boxes[None, :, 0] - gap) &
+                        (boxes[:, None, 1] < prev_boxes[None, :, 3] + gap) &
+                        (boxes[:, None, 3] > prev_boxes[None, :, 1] - gap))
+            valid &= ~overlaps.any(axis=1)
+            valid &= ~_segments_hit_boxes(la, lb, prev_boxes).any(axis=1)
+            valid &= ~_segments_hit_boxes(pa, pb, boxes).any(axis=0)
+            valid &= ~_segments_cross(la, lb, pa, pb).any(axis=1)
+        cost[~valid] = np.inf
+        if not len(cost) or not np.isfinite(cost).any():
+            return None
+        j = int(np.argmin(cost))
+        return centers[j], boxes[j], la[j], lb[j], cost[j]
+
+
+    order = sorted(range(len(records)), key=lambda i: (len(candidates[i][0]), -sizes[i, 0], i))
+    best = None
+    rng = np.random.default_rng(DETERMINISTIC_SEED)
+    orders = [order[shift:] + order[:shift] for shift in range(len(records))]
+    orders += [list(reversed(trial)) for trial in orders]
+    orders += [rng.permutation(order).tolist() for _ in range(48)]
+    for attempt, trial_order in enumerate(orders):
+        placed = {}
+        for i in trial_order:
+            candidate = choose(i, placed)
+            if candidate is None:
+                break
+            placed[i] = candidate
+        if len(placed) == len(records):
+            total = sum(item[4] for item in placed.values())
+            if best is None or total < best[0]:
+                best = total, placed
+
+            if attempt >= 5:
+                break
+    if best is None:
+        for artist in artists:
+            artist.remove()
+        raise RuntimeError('Não foi possível separar todos os rótulos; amplie o painel.')
+
+
+    placed = best[1]
+    for _ in range(6):
+        improved = False
+        for i in sorted(placed, key=lambda i: (-placed[i][4], i)):
+            previous = placed.pop(i)
+            candidate = choose(i, placed)
+            if candidate is not None and candidate[4] < previous[4] - 1e-6:
+                placed[i], improved = candidate, True
+            else:
+                placed[i] = previous
+        if not improved:
+            break
+
+    result = []
+    for i, (record, artist) in enumerate(zip(records, artists)):
+        center, box, la, lb, _ = placed[i]
+        artist.set_position(ax.transData.inverted().transform(center))
+        leader = ax.transData.inverted().transform([la, lb])
+        ax.plot(leader[:, 0], leader[:, 1], color='0.45', linewidth=0.55,
+                solid_capstyle='round', zorder=4)
+        result.append(dict(record, artist=artist, leader=np.array([la, lb])))
+    return result
+
+
+def _validate_labels(fig, ax, labels):
+
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+    boxes = [item['artist'].get_window_extent(renderer).padded(
+        LABEL_PADDING_PT * fig.dpi / 72) for item in labels]
+    bounds = ax.get_window_extent()
+    errors = []
+    for i, box in enumerate(boxes):
+        if not (bounds.contains(box.x0, box.y0) and bounds.contains(box.x1, box.y1)):
+            errors.append(f"rótulo cortado: {labels[i]['word']}")
+        for j in range(i):
+            if box.padded(LABEL_GAP_PT * fig.dpi / 72).overlaps(boxes[j]):
+                errors.append(f"{labels[i]['word']} / {labels[j]['word']}")
+        for j, item in enumerate(labels):
+            if i != j and _segments_hit_boxes(
+                    item['leader'][:1], item['leader'][1:], [box.extents])[0, 0]:
+                errors.append(f"linha de {item['word']} sobre {labels[i]['word']}")
+    if errors:
+        raise RuntimeError('Colisões na figura: ' + '; '.join(errors))
+    return len(labels)
+
+
+def _plot_path(ax, points, linestyle, marker, label):
+    line, = ax.plot(points[:, 0], points[:, 1], linestyle=linestyle,
+                    color='0.22', linewidth=1.15, marker=marker, markersize=4.2,
+                    markerfacecolor='white', markeredgewidth=0.85,
+                    label=label, zorder=3)
+
+    visible = _inside_box(points, (*ax.get_xlim(), *ax.get_ylim()))
+    display = ax.transData.transform(points)
+    for i, (a, b) in enumerate(zip(points[:-1], points[1:])):
+        if not (visible[i] and visible[i + 1]):
+            continue
+        if np.linalg.norm(display[i + 1] - display[i]) < 14 * ax.figure.dpi / 72:
+            continue
+        ax.annotate('', xy=a + 0.72 * (b - a), xytext=a + 0.54 * (b - a),
+                    arrowprops=dict(arrowstyle='-|>', color='0.22', lw=0.75,
+                                    shrinkA=0, shrinkB=0, mutation_scale=7),
+                    zorder=3)
+    return line
+
+
+def plot_comparison(model_pop, model_inst, path_pop, path_inst, word1, word2):
 
     os.makedirs(IMG_DIR, exist_ok=True)
-
     vectors_pop = np.array([model_pop[w] for w in path_pop])
     vectors_inst = np.array([model_inst[w] for w in path_inst])
-
     mean_pop = np.mean(vectors_pop, axis=0)
     mean_inst = np.mean(vectors_inst, axis=0)
-
     pca = PCA(n_components=2, svd_solver='full')
     all_v = np.vstack((vectors_pop - mean_pop, vectors_inst - mean_inst))
     all_2d = pca.fit_transform(all_v)
-
     pop_2d = all_2d[:len(vectors_pop)]
     inst_2d = all_2d[len(vectors_pop):]
     all_points = np.vstack((pop_2d, inst_2d))
+    segments = np.array([(a, b) for points in (pop_2d, inst_2d)
+                         for a, b in zip(points[:-1], points[1:])])
 
-    def _finite_range(values):
-        low = float(np.min(values))
-        high = float(np.max(values))
-        if not np.isfinite(low) or not np.isfinite(high):
-            low, high = -1.0, 1.0
-        if abs(high - low) < 1e-9:
-            low -= 0.5
-            high += 0.5
-        return low, high
+    fig = plt.figure(figsize=FIGURE_SIZE, facecolor='white')
+    ax = fig.add_axes([0.105, 0.595, 0.865, 0.265])
+    detail = fig.add_axes([0.105, 0.085, 0.865, 0.405])
+    fig.suptitle(f'Caminhos discursivos: {word1} → {word2}', fontsize=15, y=0.985)
+    for panel, title in ((ax, '(a) Visão geral'), (detail, '(b) Ampliação da zona densa')):
+        panel.set_title(title, loc='left', fontsize=11.5, pad=9)
+        panel.set_xlabel('Componente principal 1', fontsize=10, labelpad=5)
+        panel.set_ylabel('Componente principal 2', fontsize=10, labelpad=5)
+        panel.set_axisbelow(True)
+        panel.tick_params(labelsize=9, length=3, width=0.6, pad=4)
+        for axis in (panel.xaxis, panel.yaxis):
+            axis.set_major_locator(MaxNLocator(nbins=5))
+            axis.set_major_formatter(FuncFormatter(
+                lambda value, _: f'{0 if abs(value) < 1e-10 else value:g}'.replace('.', ',')))
+    fig.canvas.draw()
+    _equal_scale_limits(ax, _limits(all_points, pad_fraction=0.20))
+    zoom_box = _zoom_with_clear_markers(detail, all_points)
+    fig.canvas.draw()
 
-    def _limits(points, pad_fraction=0.12):
-        xmin, xmax = _finite_range(points[:, 0])
-        ymin, ymax = _finite_range(points[:, 1])
-        xpad = max((xmax - xmin) * pad_fraction, 0.08)
-        ypad = max((ymax - ymin) * pad_fraction, 0.08)
-        return xmin - xpad, xmax + xpad, ymin - ypad, ymax + ypad
+    handles = []
+    for panel in (ax, detail):
+        h1 = _plot_path(panel, pop_2d, '-', 'o', 'Corpus online')
+        h2 = _plot_path(panel, inst_2d, '--', 's', 'Debate eleitoral')
+        if panel is ax:
+            handles = [h1, h2]
+    fig.legend(handles=handles, loc='upper center', bbox_to_anchor=(0.53, 0.948),
+               ncol=2, frameon=False, fontsize=11, handlelength=3, columnspacing=3)
 
-    def _automatic_zoom_box(points):
-        # Crop the dense central mass. The crop is intentionally tighter than the
-        # previous version, while the inset panel itself is much larger.
-        if len(points) <= ZOOM_MIN_CORE_POINTS:
-            core = points
-        else:
-            center = np.median(points, axis=0)
-            distances = np.linalg.norm(points - center, axis=1)
-            n_core = int(np.ceil(len(points) * ZOOM_CORE_FRACTION))
-            n_core = max(ZOOM_MIN_CORE_POINTS, min(len(points), n_core))
-            core = points[np.argsort(distances, kind='mergesort')[:n_core]]
-
-        xmin, xmax = _finite_range(core[:, 0])
-        ymin, ymax = _finite_range(core[:, 1])
-
-        full_xmin, full_xmax, full_ymin, full_ymax = _limits(points, pad_fraction=0.02)
-        full_width = full_xmax - full_xmin
-        full_height = full_ymax - full_ymin
-
-        width = xmax - xmin
-        height = ymax - ymin
-        xpad = max(width * 0.20, full_width * 0.020, 0.035)
-        ypad = max(height * 0.24, full_height * 0.020, 0.035)
-
-        xmin -= xpad
-        xmax += xpad
-        ymin -= ypad
-        ymax += ypad
-
-        max_zoom_width = full_width * ZOOM_MAX_FRACTION_OF_FULL_WIDTH
-        max_zoom_height = full_height * ZOOM_MAX_FRACTION_OF_FULL_HEIGHT
-        center_x = (xmin + xmax) / 2
-        center_y = (ymin + ymax) / 2
-
-        if xmax - xmin > max_zoom_width:
-            xmin = center_x - max_zoom_width / 2
-            xmax = center_x + max_zoom_width / 2
-        if ymax - ymin > max_zoom_height:
-            ymin = center_y - max_zoom_height / 2
-            ymax = center_y + max_zoom_height / 2
-
-        return xmin, xmax, ymin, ymax
-
-    def _inside_box(points, box):
-        xmin, xmax, ymin, ymax = box
-        return (
-            (points[:, 0] >= xmin) & (points[:, 0] <= xmax) &
-            (points[:, 1] >= ymin) & (points[:, 1] <= ymax)
-        )
-
-    def _choose_inset_position(points, xlim, ylim):
-        candidates = [
-            (1.0 - INSET_WIDTH - 0.025, 1.0 - INSET_HEIGHT - 0.045, INSET_WIDTH, INSET_HEIGHT),
-            (0.025, 1.0 - INSET_HEIGHT - 0.045, INSET_WIDTH, INSET_HEIGHT),
-            (1.0 - INSET_WIDTH - 0.025, 0.040, INSET_WIDTH, INSET_HEIGHT),
-            (0.025, 0.040, INSET_WIDTH, INSET_HEIGHT),
-        ]
-
-        xmin, xmax = xlim
-        ymin, ymax = ylim
-        xr = xmax - xmin
-        yr = ymax - ymin
-
-        best_score = None
-        best_box = candidates[0]
-        for box in candidates:
-            bx, by, bw, bh = box
-            data_x0 = xmin + bx * xr
-            data_x1 = xmin + (bx + bw) * xr
-            data_y0 = ymin + by * yr
-            data_y1 = ymin + (by + bh) * yr
-            covered = (
-                (points[:, 0] >= data_x0) & (points[:, 0] <= data_x1) &
-                (points[:, 1] >= data_y0) & (points[:, 1] <= data_y1)
-            )
-            # Prefer locations that cover fewer outlying points. If tied, upper
-            # positions are slightly preferred because they read more like PIP.
-            score = int(np.sum(covered)) - (0.25 if by > 0.50 else 0.0)
-            if best_score is None or score < best_score:
-                best_score = score
-                best_box = box
-        return best_box
-
-    def _plot_path(ax, pts, linestyle, marker, label=None, linewidth=2.0, alpha=0.86, arrows=True):
-        ax.plot(
-            pts[:, 0], pts[:, 1],
-            linestyle=linestyle,
-            color='0.16',
-            linewidth=linewidth,
-            alpha=alpha,
-            marker=marker,
-            markersize=4.2,
-            markerfacecolor='white',
-            markeredgecolor='0.16',
-            markeredgewidth=0.85,
-            label=label,
-            zorder=3,
-        )
-
-        if not arrows:
-            return
-
-        xlim = ax.get_xlim()
-        ylim = ax.get_ylim()
-        xr = xlim[1] - xlim[0]
-        yr = ylim[1] - ylim[0]
-        xmargin = xr * 0.015
-        ymargin = yr * 0.015
-
-        def _inside_visible(p):
-            return (
-                xlim[0] - xmargin <= p[0] <= xlim[1] + xmargin and
-                ylim[0] - ymargin <= p[1] <= ylim[1] + ymargin
-            )
-
-        for a, b in zip(pts[:-1], pts[1:]):
-            if np.linalg.norm(b - a) < 1e-9:
-                continue
-            if not (_inside_visible(a) and _inside_visible(b)):
-                continue
-            ax.annotate(
-                '',
-                xy=(b[0], b[1]),
-                xytext=(a[0], a[1]),
-                arrowprops=dict(
-                    arrowstyle='-|>',
-                    color='0.16',
-                    lw=max(0.55, linewidth * 0.36),
-                    linestyle=linestyle,
-                    alpha=min(0.62, alpha),
-                    shrinkA=6,
-                    shrinkB=6,
-                    mutation_scale=7.5,
-                ),
-                annotation_clip=True,
-                zorder=2,
-            )
-
-    def _label_positions(ax, anchors, labels, fontsize, mode):
-        xlim = ax.get_xlim()
-        ylim = ax.get_ylim()
-        xr = xlim[1] - xlim[0]
-        yr = ylim[1] - ylim[0]
-
-        anchors_ax = np.column_stack((
-            (anchors[:, 0] - xlim[0]) / xr,
-            (anchors[:, 1] - ylim[0]) / yr,
-        ))
-        anchors_ax = np.clip(anchors_ax, 0.01, 0.99)
-
-        center = np.mean(anchors_ax, axis=0)
-        delta = anchors_ax - center
-        dist = np.linalg.norm(delta, axis=1)
-        angles = np.arctan2(delta[:, 1], delta[:, 0])
-
-        if np.nanmax(dist) < 0.06:
-            angles = np.linspace(0, 2 * np.pi, len(labels), endpoint=False)
-
-        unit = np.column_stack((np.cos(angles), np.sin(angles)))
-        unit[~np.isfinite(unit)] = 0.0
-
-        if mode == 'inset':
-            base_offset = 0.125 if len(labels) <= 18 else 0.155
-            preferred = anchors_ax + unit * base_offset
-        else:
-            preferred = anchors_ax + unit * 0.045
-
-        positions = preferred.copy()
-
-        widths = np.array([0.024 + 0.0057 * min(len(str(s)), 20) for s in labels])
-        heights = np.full(len(labels), 0.033 if fontsize <= 8 else 0.042)
-        if mode == 'inset':
-            heights *= 1.03
-
-        # Deterministic mini force layout in axis coordinates. It does not move
-        # data points; it only moves the labels and draws leader lines.
-        for _ in range(320):
-            movement = (preferred - positions) * 0.013
-            for i in range(len(labels)):
-                for j in range(i + 1, len(labels)):
-                    dx = positions[j, 0] - positions[i, 0]
-                    dy = positions[j, 1] - positions[i, 1]
-                    overlap_x = (widths[i] + widths[j]) / 2 + 0.010 - abs(dx)
-                    overlap_y = (heights[i] + heights[j]) / 2 + 0.008 - abs(dy)
-                    if overlap_x > 0 and overlap_y > 0:
-                        if overlap_x < overlap_y:
-                            push = overlap_x / 2 + 0.002
-                            direction = 1.0 if dx >= 0 else -1.0
-                            movement[i, 0] -= push * direction
-                            movement[j, 0] += push * direction
-                        else:
-                            push = overlap_y / 2 + 0.002
-                            direction = 1.0 if dy >= 0 else -1.0
-                            movement[i, 1] -= push * direction
-                            movement[j, 1] += push * direction
-
-            positions += movement
-            positions[:, 0] = np.clip(positions[:, 0], widths / 2 + 0.010, 1 - widths / 2 - 0.010)
-            positions[:, 1] = np.clip(positions[:, 1], heights / 2 + 0.012, 1 - heights / 2 - 0.012)
-
-        return np.column_stack((xlim[0] + positions[:, 0] * xr, ylim[0] + positions[:, 1] * yr))
-
-    def _annotate_words(ax, pts, words, fontsize=8, mode='main'):
-        if len(words) == 0:
-            return
-
-        pts = np.asarray(pts, dtype=float)
-        text_xy = _label_positions(ax, pts, words, fontsize=fontsize, mode=mode)
-
-        for point, label_xy, word in zip(pts, text_xy, words):
-            ax.annotate(
-                str(word),
-                xy=(point[0], point[1]),
-                xytext=(label_xy[0], label_xy[1]),
-                textcoords='data',
-                ha='center',
-                va='center',
-                fontsize=fontsize,
-                color='0.05',
-                bbox=dict(boxstyle='round,pad=0.14', fc='white', ec='none', alpha=0.88),
-                arrowprops=dict(
-                    arrowstyle='-',
-                    color='0.30',
-                    lw=0.55,
-                    alpha=0.78,
-                    shrinkA=2,
-                    shrinkB=3,
-                ),
-                annotation_clip=True,
-                zorder=6,
-            )
-
-    fig, ax = plt.subplots(figsize=(17.0, 10.0))
-    fig.patch.set_facecolor('white')
-
-    full_limits = _limits(all_points, pad_fraction=0.14)
-    full_xlim = full_limits[:2]
-    full_ylim_tuple = full_limits[2:]
-    ax.set_xlim(*full_xlim)
-    ax.set_ylim(*full_ylim_tuple)
-
-    _plot_path(ax, pop_2d, '-', 'o', label='Discurso Popular', linewidth=2.35, alpha=0.88, arrows=True)
-    _plot_path(ax, inst_2d, '--', 's', label='Discurso Institucional', linewidth=2.35, alpha=0.88, arrows=True)
-
-    zoom_box = _automatic_zoom_box(all_points)
     zx0, zx1, zy0, zy1 = zoom_box
+    ax.add_patch(Rectangle((zx0, zy0), zx1 - zx0, zy1 - zy0,
+                           fill=False, edgecolor='0.45', linewidth=0.9,
+                           linestyle=':', zorder=2))
+    tag = ax.text(zx0, zy1, '(b)', ha='left', va='bottom', fontsize=9,
+                  color='0.30', bbox=dict(fc='white', ec='none', pad=1), zorder=5)
+    fig.canvas.draw()
+    reserved = [tag.get_window_extent(fig.canvas.get_renderer()).padded(3).extents]
 
-    zoom_rect = Rectangle(
-        (zx0, zy0),
-        zx1 - zx0,
-        zy1 - zy0,
-        fill=False,
-        edgecolor='0.20',
-        linewidth=1.05,
-        linestyle=':',
-        zorder=4,
-    )
-    ax.add_patch(zoom_rect)
-    ax.text(
-        zx0,
-        zy1,
-        ' detalhe ampliado ',
-        fontsize=8.5,
-        ha='left',
-        va='bottom',
-        color='0.20',
-        bbox=dict(boxstyle='round,pad=0.12', fc='white', ec='0.75', alpha=0.88),
-        zorder=7,
-    )
-
-    pop_in_zoom = _inside_box(pop_2d, zoom_box)
-    inst_in_zoom = _inside_box(inst_2d, zoom_box)
-
-    main_pop_idx = [i for i in range(len(path_pop)) if i in (0, len(path_pop) - 1) or not pop_in_zoom[i]]
-    main_inst_idx = [i for i in range(len(path_inst)) if i in (0, len(path_inst) - 1) or not inst_in_zoom[i]]
-
-    _annotate_words(ax, pop_2d[main_pop_idx], [path_pop[i] for i in main_pop_idx], fontsize=9, mode='main')
-    _annotate_words(ax, inst_2d[main_inst_idx], [path_inst[i] for i in main_inst_idx], fontsize=9, mode='main')
-
-    ax.set_title(f'Comparação de Caminhos Discursivos: {word1} → {word2}', fontsize=16, pad=16)
-    ax.grid(True, alpha=0.28, linewidth=0.8)
-    ax.axhline(0, color='0.80', lw=0.7, zorder=0)
-    ax.axvline(0, color='0.80', lw=0.7, zorder=0)
-    ax.set_aspect('equal', adjustable='box')
-
-    legend = ax.legend(
-        loc='upper center',
-        bbox_to_anchor=(0.5, 1.035),
-        ncol=2,
-        frameon=True,
-        framealpha=0.96,
-        fontsize=10,
-    )
-    legend.get_frame().set_edgecolor('0.78')
-
-    inset_box_axes = _choose_inset_position(all_points, ax.get_xlim(), ax.get_ylim())
-    axins = ax.inset_axes(inset_box_axes)
-    axins.set_facecolor('white')
-    for spine in axins.spines.values():
-        spine.set_linewidth(1.05)
-        spine.set_edgecolor('0.20')
-
-    axins.set_xlim(zx0, zx1)
-    axins.set_ylim(zy0, zy1)
-
-    _plot_path(axins, pop_2d, '-', 'o', label=None, linewidth=1.72, alpha=0.90, arrows=True)
-    _plot_path(axins, inst_2d, '--', 's', label=None, linewidth=1.72, alpha=0.90, arrows=True)
-    axins.set_aspect('equal', adjustable='box')
-    axins.grid(True, alpha=0.22, linewidth=0.6)
-    axins.tick_params(labelsize=7, length=2.5, pad=1)
-    axins.set_title('zoom da zona densa', fontsize=10, pad=4)
-
-    inset_pop_idx = [i for i, inside in enumerate(pop_in_zoom) if inside]
-    inset_inst_idx = [i for i, inside in enumerate(inst_in_zoom) if inside]
-
-    _annotate_words(axins, pop_2d[inset_pop_idx], [path_pop[i] for i in inset_pop_idx], fontsize=7.7, mode='inset')
-    _annotate_words(axins, inst_2d[inset_inst_idx], [path_inst[i] for i in inset_inst_idx], fontsize=7.7, mode='inset')
-
+    main_records, detail_records = [], []
+    for corpus, points, words in (('online', pop_2d, path_pop),
+                                  ('debate', inst_2d, path_inst)):
+        inside = _inside_box(points, zoom_box)
+        for i, (point, word) in enumerate(zip(points, words)):
+            record = dict(point=point, word=word, corpus=corpus,
+                          endpoint=i in (0, len(words) - 1))
+            (detail_records if inside[i] else main_records).append(record)
     try:
-        ax.indicate_inset_zoom(axins, edgecolor='0.25', linewidth=0.7, alpha=0.8)
-    except Exception:
-        # Older Matplotlib versions may not have indicate_inset_zoom. The dotted
-        # rectangle still marks the zoomed area, so plotting can continue.
-        pass
-
-    filename = os.path.join(IMG_DIR, f'{word1}_{word2}_discursive_paths_comparison.{OUTPUT_FORMAT}')
-    fig.savefig(
-        filename,
-        bbox_inches='tight',
-        format=OUTPUT_FORMAT,
-        metadata={
-            'Creator': 'geometrias_discursivas_inset_zoom.py',
-            'Producer': 'Matplotlib',
-            'CreationDate': None,
-            'ModDate': None,
-        },
-    )
-    plt.close(fig)
+        main_labels = _place_labels(ax, main_records, all_points, segments, reserved)
+        detail_labels = _place_labels(detail, detail_records, all_points, segments)
+        counts = [_validate_labels(fig, panel, labels)
+                  for panel, labels in ((ax, main_labels), (detail, detail_labels))]
+        assert sum(counts) == len(path_pop) + len(path_inst)
+        filename = os.path.join(IMG_DIR, f'{word1}_{word2}_discursive_paths_comparison.{OUTPUT_FORMAT}')
+        fig.savefig(filename, format=OUTPUT_FORMAT, metadata={
+            'Title': f'Caminhos discursivos: {word1} → {word2}',
+            'Creator': os.path.basename(__file__), 'Producer': 'Matplotlib',
+            'CreationDate': None, 'ModDate': None,
+        })
+    finally:
+        plt.close(fig)
 
     if DELETE_STALE_PNG_FILES:
-        stale_png = os.path.join(IMG_DIR, f'{word1}_{word2}_discursive_paths_comparison.png')
+        stale_png = os.path.splitext(filename)[0] + '.png'
         if os.path.exists(stale_png):
             os.remove(stale_png)
-
     print(f'  Figura salva: {filename}')
+    print(f'  Verificação: {sum(counts)} rótulos, sem sobreposição ou corte.')
+    return filename
 
 
 def main():
@@ -768,7 +739,7 @@ def main():
     for word1, word2 in WORD_PAIRS:
         print(f'Calculando caminho: {word1} → {word2}')
         path_pop, path_inst = compute_or_load_paths(model_comentarios, model_debates, word1, word2)
-        print(f'  Popular: {" → ".join(path_pop)}')
+        print(f'  Online:  {" → ".join(path_pop)}')
         print(f'  Debate:  {" → ".join(path_inst)}')
         plot_comparison(model_comentarios, model_debates, path_pop, path_inst, word1, word2)
 
